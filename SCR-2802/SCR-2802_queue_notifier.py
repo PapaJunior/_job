@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # Данный скрипт шлёт уведомления, когда кол-во людей в указанных зонах достигает
-# заданный порог на протяжении установленного времени
+# пороговое значение на протяжении установленного времени
 # Имена зон общие для всех каналов. Кол-во людей считается по каждой зоне на канале
 # При детектировании количества людей равного или большего заданному
 # скрипт может вызывать реакции: всплывающее окно с информацией, отправка уведомления на e-mail,
@@ -13,7 +13,7 @@
 	<version>1.1</version>
 <parameter>
     <type>objects</type>
-    <id>CHANNS</id>
+    <id>CHANNELS</id>
     <name>Каналы для детектирования</name>
     <value></value>
 </parameter>
@@ -88,17 +88,17 @@
 	</parameter>
 	<parameter>
 		<id>CLEAR_SCREEN</id>
-		<name>Удалять файлы после отправки</name>
+		<name>Удалять скриншоты после отправки</name>
 		<type>boolean</type>
 		<value>False</value>
 	</parameter>
 	<parameter>
-		<id>EMAIL_SENDER</id>
+		<id>MAIL_ACCOUNT</id>
 		<name>Учетная запись отправителя, созданная в Trassir</name>
 		<type>string</type>
 	</parameter>
 	<parameter>
-		<id>EMAIL_RECIEVER</id>
+		<id>MAIL_RECIPIENTS</id>
 		<name>Список получателей через запятую</name>
 		<type>string</type>
     </parameter>
@@ -130,7 +130,6 @@
 		<type>boolean</type>
 		<value>False</value>
 	</parameter>
-
 </parameters>
 '''
 
@@ -5123,20 +5122,20 @@ class DeepDetectionHandler:
     Принимает события детектора людей
     """
 
-    def __init__(self, channs, zones):
+    def __init__(self, channels, zones):
         """
         self.detections_on_channels - is a dict. key is a 'chan_guid_o.o_zone_guid' and value is
         ChannelEvents instance with attribute all_detections: [(1550054086, 5), (1550054117, 4)]
 
         """
-        self._channs = channs
+        self._channels = channels
         self._zones = zones
 
         self.channels = []
         self.zones = []
         self.detections_on_channels = dict()
 
-        self.set_channels(self._channs)
+        self.set_channels(self._channels)
         self.set_zones(self._zones)
 
     def not_static_method(self):
@@ -5352,14 +5351,22 @@ class DeepDetectionsWatcher:
 class MakeAction:
     storage_file_message = {}
     files_to_delete = []
+    screenshots_sub_folder = 'queue_screenshots'
 
     def __init__(self):
         pass
+
+    @property
+    @staticmethod
+    def screenshots_folder():
+        screenshots_folder = os.path.join(BaseUtils.get_screenshot_folder(), MakeAction.screenshots_sub_folder)
+        return screenshots_folder
 
     @staticmethod
     def delete_file(filepath):
         try:
             os.remove(filepath)
+            logger.debug('removed successful %s' % filepath )
             return True
         except Exception as err:
             logger.error("Can't remove file: %s" % err)
@@ -5372,7 +5379,7 @@ class MakeAction:
             if time.time() - tmstmp > 200:
                 MakeAction.delete_file(file_path)
             else:
-                files_to_delete.append(tmstmp, file_path)
+                files_to_delete.append((tmstmp, file_path))
         MakeAction.files_to_delete = files_to_delete
 
 
@@ -5431,11 +5438,10 @@ class MakeAction:
     @staticmethod
     def send_email_image(image_path, alarm_message, subject):
         email_sender.image(image_path, text=alarm_message, subject=subject)
-        MakeAction.files_to_delete.append(time.time(), image_path)
+        MakeAction.files_to_delete.append((time.time(), image_path))
 
     @staticmethod
-    def send_email(alarm_message, image_path=None):
-        subject = "Максимальное количество людей"
+    def send_email(alarm_message, subject="Максимальное количество людей", image_path=None):
         logger.debug('Start prepare before send message. image_path: %s' % image_path)
         if not SAVE_SCREEN:
             MakeAction.send_email_text(alarm_message, subject)
@@ -5444,17 +5450,16 @@ class MakeAction:
             MakeAction.storage_file_message[image_path] = (subject, alarm_message)
             #logger.debug('image_path: %s, subject: %s, alarm_message: %s' % (image_path, subject, alarm_message))
             return
-        # email_sender.image(image_path, text=alarm_message, subject=subject)
 
     @staticmethod
     def make_screenshot(channel_full_guid, dt=None, file_name=None):
         logger.debug('make_screenshot channel_full_guid: %s' % channel_full_guid)
+
         shot_saver.async_shot(channel_full_guid,
                               dt=dt,
                               file_name=file_name,
-                              file_path=None,
+                              file_path=MakeAction.screenshots_folder,
                               callback=MakeAction.call_back_screen_shot)
-        #ss.async_shot(full_guid, dt=None, file_name=None, file_path=None,callback=call_back )
 
     @staticmethod
     def ok():
@@ -5476,7 +5481,6 @@ class MakeAction:
             winsound.PlaySound(filename, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NOWAIT)
         else:
             import os
-            # os.system('aplay %s &' % filename)
             os.system('aplay -D "sysdefault:CARD=PCH" %s &' % filename)
 
     @staticmethod
@@ -5536,7 +5540,6 @@ class MakeAction:
             if SAVE_SCREEN:
                 logger.debug("start save screen")
                 MakeAction.make_screenshot(channel_full_guid=channel_full_guid, dt=dt, file_name=file_name)
-                #MakeAction.make_screenshot(channel_full_guid, dt=dt, file_name=file_name)
             if PLAY_SOUND:
                 MakeAction.play_sound(os.getcwd() + "/sounds/" + SOUND_NAME)
             if SEND_SMS:
@@ -5547,18 +5550,15 @@ class MakeAction:
 
 """  Initialization  """
 
-#if SEND_EMAIL and SEND_SCREEN and not SAVE_SCREEN:
-#    raise ValueError("Поставьте галку 'Cохранять скриншот' или уберите галку 'Прикрепить снимок к e-mail'!")
-
 if SEND_EMAIL:
-    email_sender = EmailSender(EMAIL_SENDER, EMAIL_RECIEVER)
+    email_sender = EmailSender(MAIL_ACCOUNT, MAIL_RECIPIENTS)
 
-assert CHANNS, 'Необходимо выбрать каналы для работы!'
+assert CHANNELS, 'Необходимо выбрать каналы для работы!'
 assert ZONES, 'Необходимо выбрать зоны для работы!'
 
 shot_saver = ShotSaver()
 
-deep_detection_handler = DeepDetectionHandler(CHANNS, ZONES)
+deep_detection_handler = DeepDetectionHandler(CHANNELS, ZONES)
 activate_on_events("Object Entered the Zone", "", deep_detection_handler.handler)
 
 deep_detections_watcher = DeepDetectionsWatcher(DEEP_DETECTIONS_RISE_EVENT_DELAY, MAXPERSONS, MakeAction.process_ev)
