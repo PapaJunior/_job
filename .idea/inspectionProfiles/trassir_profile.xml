@@ -1,0 +1,21 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="trassir_profile" />
+    <inspection_tool class="PyUnresolvedReferencesInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredIdentifiers">
+        <list>
+          <option value="host" />
+          <option value="CONFIDENCE" />
+          <option value="DETECTOR_TYPE" />
+          <option value="CHANS" />
+          <option value="objects_list" />
+          <option value="ZONES" />
+          <option value="tr" />
+          <option value="EXPORT_AT_STARTUP" />
+          <option value="path_arbitrary_data()" />
+          <option value="settings" />
+        </list>
+      </option>
+    </inspection_tool>
+  </profile>
+</component>
