@@ -1,10 +1,23 @@
 # -*- coding: utf-8 -*-
-# Данный скрипт шлёт уведомления, когда кол-во людей в указанных зонах достигает
+# Уведомления о наступлении события
+# Скрипт шлёт уведомления, когда кол-во людей в указанных зонах достигает
 # пороговое значение на протяжении установленного времени
 # Имена зон общие для всех каналов. Кол-во людей считается по каждой зоне на канале
 # При детектировании количества людей равного или большего заданному
 # скрипт может вызывать реакции: всплывающее окно с информацией, отправка уведомления на e-mail,
 # отправка SMS и сохранение скриншота
+
+# Отчет по событиям
+# Скрипт создаёт отчёт в котором отражается информация по наступившим событиям:
+# дата/время события, количество людей, имя зоны, имя канала
+# Суточный отчет формируется в 00:00
+# Недельный и месячный отчеты формируются по окончанию недели
+# и месяца соответственно
+# Отчет по расписанию включает в себя информацию за предыдущие
+# сутки, плюс за время прошедшее с начала текущих суток
+# Скрипт запускается на клиенте, для обработки событий со всех серверов
+# Для работы скрипта необходимо создать БД PostgresSQL*
+# * Эта база должна быть независимой от основной БД, используемой Trassir
 
 '''
 <parameters>
@@ -99,7 +112,12 @@
 	</parameter>
 	<parameter>
 		<id>MAIL_RECIPIENTS</id>
-		<name>Список получателей через запятую</name>
+		<name>Список получателей уведомлений через запятую</name>
+		<type>string</type>
+    </parameter>
+    	<parameter>
+		<id>REPORT_MAIL_RECIPIENTS</id>
+		<name>Список получателей отчётов через запятую</name>
 		<type>string</type>
     </parameter>
     <parameter>
@@ -124,6 +142,62 @@
 		<id>SMSC_PASSWORD</id>
 		<value></value>
 	</parameter>
+	<parameter>
+        <type>caption</type>
+        <name>""" Настройки БД """</name>
+    </parameter>
+    <parameter>
+    <type>string</type>
+    <name>Имя базы данных</name>
+    <id>DATA_BASE_NAME</id>
+    <value>people_quantity_reporter</value>
+    </parameter>
+    <parameter>
+    <type>string</type>
+     <name>Логин базы данных</name>
+    <id>DATA_BASE_LOGIN</id>
+    <value>postgres</value>
+    </parameter>
+    <parameter>
+    <type>string</type>
+    <name>Пароль базы данных</name>
+    <id>DATA_BASE_PASS</id>
+    <value>123456</value>
+    </parameter>
+     <parameter>
+        <type>caption</type>
+        <name>Отчет по расписанию</name>
+    </parameter>
+     <parameter>
+        <type>boolean</type>
+        <name>Отправлять отчет за два дня по расписанию</name>
+        <id>ENABLE_SCHEDULE</id>
+        <value>False</value>
+    </parameter>
+    <parameter>
+		<id>SCHEDULE</id>
+		<name>Расписание для отправки отчета</name>
+		<type>objects</type>
+	</parameter>
+	<parameter>
+		<id>SCHEDULE_COLOR</id>
+		<name>Цвет расписания для отправки отчета</name>
+		<type>string_from_list</type>
+		<value>Красный</value>
+		<string_list>Красный,Зелёный,Синий</string_list>
+	</parameter>
+
+    <parameter>
+        <type>caption</type>
+        <name>Дополнительные настройки</name>
+    </parameter>
+
+<parameter>
+        <type>boolean</type>
+        <name>Сделать отчет при запуске скрипта</name>
+        <id>EXPORT_AT_STARTUP</id>
+        <value>True</value>
+</parameter>
 	<parameter>
 		<id>DEBUG</id>
 		<name>Лог</name>
@@ -159,6 +233,12 @@ from __builtin__ import object as py_object
 
 import copy
 
+
+import calendar
+from sqlalchemy import MetaData
+from sqlalchemy import Table, Column, Integer, BigInteger, Unicode, create_engine, select, and_
+import psycopg2
+import xlsxwriter
 
 class ScriptError(Exception):
     """Base script exception"""
@@ -4453,7 +4533,7 @@ class PopupWithBtnSender(Sender):
 
 
 class EmailSender(Sender):
-    """Класс для отправки уведомлений, изображений и файлоа на почту
+    """Класс для отправки уведомлений, изображений и файлов на почту
 
     Note:
         По умолчанию тема сообщений соответствует шаблону
@@ -5064,6 +5144,440 @@ else:
 
 logger = BaseUtils.get_logger(name=None, host_log=None, popup_log=None, file_log=log_level, file_name=None)
 
+##########################################
+#            Report part                 #
+#########################################
+
+class DatesSupplier:
+    """
+    Diffrent manipulations with dates
+    """
+    def __init__(self):
+        self._current_day = datetime.now().date().isoformat()  # "2000-01-01"
+
+    def day_changed(self):
+        """Check if day changed"""
+        try:
+            today = datetime.now().date().isoformat()
+            day_changed = self._current_day != today
+
+            if day_changed:
+                logger.info("DataManager: day changed {} -> {}".format(self._current_day, today))
+                self._current_day = today
+            return day_changed, today
+        except:
+            """Catch exceptions in thread"""
+            logger.critical("Check day error", exc_info=True)
+
+    @staticmethod
+    def get_dates_of_previous_month():
+        month_last_day = (datetime.now() - timedelta(datetime.now().day)).date()
+        month_first_day = month_last_day - timedelta(month_last_day.day - 1)
+        monthdays = [date(month_first_day.year, month_first_day.month, d).isoformat()
+                     for d in xrange(1, month_last_day.day+1)]
+
+        return monthdays
+
+
+    @staticmethod
+    def get_dates_of_previous_week():
+        week_day = datetime.now().weekday()
+        date_monday = (datetime.now() - timedelta(week_day + 7)).date()
+        weekdays = [(date_monday + timedelta(i)).isoformat() for i in xrange(0,7)]
+
+        return weekdays
+
+
+    @staticmethod
+    def get_boundary_trassir_timestamp_of_the_day(date_time_obj=None):
+        """
+        time_yesterday - datatime obj
+        return trassir timestamp of begin and end of the time_yesterday
+        """
+        if date_time_obj is None:
+            date_time_obj = datetime.now() - timedelta(1)
+        boundary = ['00:00:00', '23:59:59']
+        boundary_trassir_timestamp = []
+        for x in boundary:
+            dt = datetime.strptime("{}-{}-{} {}".format(date_time_obj.timetuple().tm_year,
+                                                        date_time_obj.timetuple().tm_mon,
+                                                        date_time_obj.timetuple().tm_mday,
+                                                        x), "%Y-%m-%d %H:%M:%S")
+            _tstmp = "{}000000".format(int(time.mktime(dt.timetuple())))
+            boundary_trassir_timestamp.append(_tstmp)
+
+        return boundary_trassir_timestamp[0], boundary_trassir_timestamp[1]
+
+
+class DataBaseManager:
+    """
+    All engine settings and DB interactions
+    """
+    def __init__(self):
+        self.db_name = DATA_BASE_NAME
+        self.db_login = DATA_BASE_LOGIN
+        self.db_pass = DATA_BASE_PASS
+        self.metadata = MetaData()
+        self.retry_counter = 0
+
+        self.people_quantity = self.initialize_people_quantity_table()
+        self.connection = self.connect_to_database()
+        self.persisting_the_tables()
+
+    def connect_to_database(self):
+        self.engine = create_engine(
+            'postgresql://{}:{}@localhost:5432/{}'.format(self.db_login,
+                                                          self.db_pass,
+                                                          self.db_name
+                                                          ))
+        try:
+            return self.engine.connect()
+        except Exception as err:
+            raise ValueError(unicode(err[0], 'cp1251'))
+
+
+
+    def persisting_the_tables(self):
+        """
+        Создаёт таблицу, если её нет
+        """
+        self.metadata.create_all(self.engine)
+
+    def initialize_people_quantity_table(self):
+        _people_quantity = Table('people quantity detection', self.metadata,
+                                     Column('event_id', BigInteger(), primary_key=True, autoincrement=True),
+                                     Column('channel_name', Unicode()),
+                                     Column('zone_name', Unicode()),
+                                     Column('people_quantity', Integer()),
+                                     Column('event_ts', BigInteger()),
+                                     )
+        return _people_quantity
+
+    def insert_data(self, channel_name, zone_name, people_quantity, event_ts):
+        ins = self.people_quantity.insert().values(
+            channel_name=channel_name,
+            zone_name=zone_name,
+            people_quantity=people_quantity,
+            event_ts=event_ts
+        )
+        result = self.connection.execute(ins)
+        logger.info(result)
+
+    def add_data(self, data):
+        """
+        Format data before insert to database
+        """
+        if not isinstance(data, dict):
+            return
+        event_ts = data.get('event_ts')
+        channel_name = data.get('channel_name')
+        people_quantity = data.get('people_quantity')
+        zone_name = data.get('zone_name')
+        if not (event_ts and channel_name and people_quantity and zone_name):
+            logger.debug('Not all information to add to DataBase')
+            return
+        logger.debug('Start insert data in DB')
+        self.insert_data(channel_name, zone_name, people_quantity, event_ts)
+
+    def _get_data(self, begin_ts, end_ts):
+        """
+        makes  querys to database to get information
+        """
+        #s = select([self.people_quantity]).where(self.people_quantity.c.event_ts.between(begin_ts,end_ts))
+        s = select([self.people_quantity]).where(
+                and_(self.people_quantity.c.event_ts > begin_ts,
+                     self.people_quantity.c.event_ts < end_ts
+                     )
+                )
+        s = s.order_by(self.people_quantity.c.event_ts)
+        rp = self.connection.execute(s)
+        return rp.fetchall()
+
+    def get_data(self, date):
+        """
+        :param date: str '2019-05-31'
+        :return: response from data base [(),]
+        """
+        begin_ts, end_ts = DatesSupplier.get_boundary_trassir_timestamp_of_the_day(
+            datetime.strptime(date, '%Y-%m-%d').date())
+        res = self._get_data(begin_ts, end_ts)
+        return res
+
+    def get_data_wide_range(self):
+        """
+        Возвращает выборку из БД по времени, временной диапазон:
+        timestamp начала вчерашнего дня, timestamp - конца текущей даты
+        """
+        today_date = datetime.now().date()
+        yestarday_date = today_date - timedelta(days=1)
+        begin_ts = DatesSupplier.get_boundary_trassir_timestamp_of_the_day(yestarday_date)[0]
+        end_ts = DatesSupplier.get_boundary_trassir_timestamp_of_the_day(today_date)[1]
+        res = self._get_data(begin_ts, end_ts)
+        return res
+
+
+class Reporter:
+    '''
+    Prepares and makes reports
+    '''
+    def __init__(self, mail_api, data_loader, get_data_wide_range):
+        self._mail_api = mail_api
+        self._data_loader = data_loader
+        self._wide_range_data_loader = get_data_wide_range
+        self.report_path = Reporter.reports_folder()
+
+    @staticmethod
+    def reports_folder():
+        screenshot_folder = BaseUtils.get_screenshot_folder()
+        _report_folder = os.path.join(screenshot_folder,'People_reports')
+        try:
+            os.mkdir(_report_folder)
+        except OSError as err:
+            logger.error('Folder allready exists: %s' % err)
+        return _report_folder
+
+    def _send_report(self, filepaths_list):
+        """Send report to mail
+
+        Args:
+            filepaths_list (list) : list of full path to file
+        """
+        logger.info("Reporter: send file {}".format(json.dumps(filepaths_list)))
+        host.stats()["run_count"] += 1
+        self._mail_api.files(filepaths_list)
+
+    @staticmethod
+    def _get_yesterday_week(yesterday):
+        """Returns (list) days of the week in isoformat '%Y-%m-%d'
+
+        Args:
+            yesterday (date) : Yesterday
+        """
+        weekdays = [(yesterday + timedelta(days=i)).isoformat()
+                    for i in xrange(0 - yesterday.weekday(), 7 - yesterday.weekday())]
+        return weekdays
+
+    @staticmethod
+    def _get_yesterday_month(yesterday):
+        """Returns (list) days of the month in isoformat '%Y-%m-%d'
+
+        Args:
+            yesterday (date) : Yesterday
+        """
+        month_days = calendar.monthrange(yesterday.year, yesterday.month)[1]
+        monthdays = [date(yesterday.year, yesterday.month, d).isoformat() for d in xrange(1, month_days + 1)]
+        return monthdays
+
+    @staticmethod
+    def ts_to_datetime(ts):
+        return datetime.fromtimestamp(ts / 10 ** 6)
+
+
+    def _load_data(self, report_days):
+        """Returns data from database"""
+        """
+        _data_loader - возвращает список словарей
+        [{'event_ts': 1559320756562406L, 'channel_name': '\xd0\x9e\xd1\x87\xd0\xb5\xd1\x80\xd0\xb5\xd0\xb4\xd1\x8c1',
+         'person_quantity': 6, 'zone_name': 'Default Zone'}, ...]
+        """
+        data = {day: self._data_loader(day) for day in report_days}
+        return data
+
+    def _prepare_report_params(self, today_str):
+        """Preparing dates for report"""
+        today = datetime.strptime(today_str, '%Y-%m-%d').date()
+        yesterday = today - timedelta(days=1)
+        report_days = {"daily": [yesterday.isoformat(), today_str]}
+
+        if today.weekday() == 0:
+            report_days["weekly"] = self._get_yesterday_week(yesterday)
+        if today.day == 1:
+            report_days["monthly"] = self._get_yesterday_month(yesterday)
+
+        return report_days, yesterday
+
+    def _make_xlsx(self, report_type, report_data, report_day):
+        """Create report in *.xlsx format
+
+        Args:
+            report_type (str) : daily/weekly/monthly (used in filename)
+            report_data (dict) : All data for report
+            report_day (str) : Day for report (used in filename)
+        """
+        filename = "{}_{}.xlsx".format(report_type, report_day)
+        path = os.path.join(self.report_path, filename)
+        logger.debug("Reporter: creating {}".format(filename))
+
+        workbook = xlsxwriter.Workbook(path)
+
+        cell_format = {
+            "hat": workbook.add_format({
+                'bold': True,
+                'text_wrap': True,
+                'font_size': 14,
+            }),
+            "header": workbook.add_format({
+                'bold': True,
+                'align': 'center',
+                'valign': 'vcenter',
+                'text_wrap': True,
+                'border': 1,
+            }),
+            "text": workbook.add_format({
+                'valign': 'vcenter',
+                'align': 'center',
+                'border': 1,
+            }),
+            "black": workbook.add_format({
+                'font_color': 'black',
+            }),
+            "grey": workbook.add_format({
+                'font_color': '#b2b2b2',
+            }),
+            "date": workbook.add_format({
+                'num_format': 'yyyy.mm.dd',
+                'align': 'center',
+                'valign': 'vcenter',
+                'border': 1,
+            }),
+            "time": workbook.add_format({
+                'num_format': 'hh:mm:ss',
+                'align': 'center',
+                'valign': 'vcenter',
+                'border': 1,
+            }),
+        }
+
+        for day in sorted(report_data.keys()):
+            data = report_data[day]
+
+            worksheet = workbook.add_worksheet(day)
+            worksheet.set_column(0, 0, 5)
+            worksheet.set_column(1, 2, 12)
+            worksheet.set_column(3, 3, 25)
+            worksheet.set_column(4, 5, 15)
+
+            if data:
+                worksheet.merge_range(0, 0, 0, 5,
+                                      u'Количество записей в отчете: {}'.format(len(data)),
+                                      cell_format["hat"]
+                                      )
+
+                worksheet.write(1, 0, u"№", cell_format["header"])
+                worksheet.write(1, 1, u"Дата", cell_format["header"])
+                worksheet.write(1, 2, u"Время", cell_format["header"])
+                worksheet.write(1, 3, u"Название канала", cell_format["header"])
+                worksheet.write(1, 4, u"Название зоны", cell_format["header"])
+                worksheet.write(1, 5, u"Кол-во людей", cell_format["header"])
+
+            else:
+                worksheet.merge_range(0, 0, 0, 5,
+                                      u'Днные отсутствуют',
+                                      cell_format["hat"])
+
+            for idx, row in enumerate(data, 2):
+
+                # row = (18841L, u'\u041e\u0447\u0435\u0440\u0435\u0434\u044c1', u'Cash1', 3, 1559459961420148L)
+
+                dt = self.ts_to_datetime(row[-1])
+
+                worksheet.write(idx, 0, idx - 1, cell_format['text'])
+                worksheet.write(idx, 1, dt, cell_format['date'])
+                worksheet.write(idx, 2, dt, cell_format['time'])
+                worksheet.write(idx, 3, row[1], cell_format['text'])
+                worksheet.write(idx, 4, row[2], cell_format['text'])
+                worksheet.write(idx, 5, row[3], cell_format['text'])
+
+        workbook.close()
+
+        return path
+
+    def generate_reports(self, today_str, wide_range=False):
+        """Generate reports for yesterday
+        Точка входа
+        "" Если wide_range == True, то отчет формируется за предыдущие сутки
+         +  всё что накопилось на текущий момент
+
+        Args:
+            today_str (str) : Today date in isoformat "%Y-%m-%d"
+            report_days = {'monthly': ['2019-04-01',  ..., '2019-04-30'],
+                           'weekly': ['2019-04-22', ..., '2019-04-28'],
+                           'daily': ['2019-04-30']}
+        """
+        try:
+            if not wide_range:
+                report_days, yesterday = self._prepare_report_params(today_str)
+                report_data = {report_type: self._load_data(report_dates)
+                               for report_type, report_dates in report_days.iteritems()}
+
+            else:
+                yesterday = datetime.now().date()
+                report_data = {'wide_range': {datetime.now().date().isoformat(): self._wide_range_data_loader()}}
+
+            reports = [self._make_xlsx(report_type, report_data, yesterday.isoformat())
+                       for report_type, report_data in report_data.iteritems()]
+
+            self._send_report(reports)
+
+        except:
+            """Catch exceptions in thread"""
+            logger.critical("Generate reports error", exc_info=True)
+
+
+class Manager:
+    """
+
+    """
+
+    def __init__(self):
+        self._current_day = datetime.now().date().isoformat()  # "2000-01-01"
+
+    def day_changed(self):
+        """Check if day changed"""
+        try:
+            today = datetime.now().date().isoformat()
+            day_changed = self._current_day != today
+
+            if day_changed:
+                logger.info("DataManager: day changed {} -> {}".format(self._current_day, today))
+                self._current_day = today
+            return day_changed, today
+        except:
+            """Catch exceptions in thread"""
+            logger.critical("Check day error", exc_info=True)
+
+
+@BaseUtils.run_as_thread
+def worker(check_day, reports_generator, first_export=True):
+    """Work iteration
+
+    Check if day changed every second
+    Start export if day changed or first_export = True
+    Working in thread to avoid sleep main trassir process
+
+    Args:
+        check_day (func) : Must return True/False if day changed or not and current day
+        reports_generator (func) : Starting generate report when day changed
+        first_export (bool, optional) : Start export after start script
+    """
+    if first_export:
+        date_now = datetime.now().date().isoformat()
+        reporter.generate_reports(date_now, wide_range=True)
+        check_day()
+
+    while True:
+        day_changed, current_day = check_day()
+        if day_changed:
+            reports_generator(current_day)
+        time.sleep(1)
+
+# mail_sender = EmailSender(account=MAIL_ACCOUNT, mailing_list=MAIL_RECIPIENTS, subject=MAIL_SUBJECT)
+# deep_detection_handler = DeepDetectionHandler(dd_callback=db_manager.add_data)
+# activate_on_deep_detection_events(deep_detection_handler.handler)
+
+###################################
+#          Notifier               #
+###################################
 
 class MaxCountPeople:
     """
@@ -5239,13 +5753,16 @@ class DeepDetectionsWatcher:
         количество заданных объектов >=  self.maxpersons, то генерируется
         событие Deep_Objects_Quantity_Exceed_Event
 
-        callback - process_ev. вызывает к-л action
+        method_rise_event() - в этом методе через call back вызываются:
+        MakeAction.process_ev()
+        DataBaseManager.add_data()
     """
 
-    def __init__(self, duration_of_people_exceed, maxpersons, call_back):
+    def __init__(self, duration_of_people_exceed, maxpersons, process_call_back, db_add_call_back):
         self.duration_of_people_exceed = duration_of_people_exceed
         self.maxpersons = maxpersons
-        self.call_back = call_back
+        self.process_call_back = process_call_back
+        self.db_add_call_back = db_add_call_back
 
     def check_chain_of_detections(self, detections, detections_instance):
         """
@@ -5307,7 +5824,17 @@ class DeepDetectionsWatcher:
 
         ts = int(time.time()) * 1000000
         exceed_event = MaxCountPeople(ts, channel_guid, zone_guid, objects_detected_quantity)
-        self.call_back(exceed_event)
+        self.process_call_back(exceed_event)
+
+        prepared_data = dict()
+        prepared_data["channel_name"] = unicode(object(channel_guid).name)
+        prepared_data["event_ts"] = ts
+        prepared_data["zone_name"] = unicode(object(zone_guid).name)
+        prepared_data["people_quantity"] = objects_detected_quantity
+        #logger.debug('prepared_data: %s' % prepared_data)
+        self.db_add_call_back(prepared_data)
+
+
 
     def check_detections_instances_on_channels(self, detections_instances_on_channels):
         """
@@ -5316,8 +5843,8 @@ class DeepDetectionsWatcher:
         """
         for channel_zone, detections_instance in detections_instances_on_channels.iteritems():
             detections = detections_instance.get_all_detections()
-            if detections:
-                logger.debug('channel_zone: %s, all detections: %s' % (channel_zone, detections))
+            # if detections:
+            #     logger.debug('channel_zone: %s, all detections: %s' % (channel_zone, detections))
             if not detections or len(detections) == 1:
                 continue
 
@@ -5352,15 +5879,16 @@ class MakeAction:
     storage_file_message = {}
     files_to_delete = []
     screenshots_sub_folder = 'queue_screenshots'
+    screenshot_folder = screenshots_folder = os.path.join(BaseUtils.get_screenshot_folder(), screenshots_sub_folder)
 
     def __init__(self):
         pass
 
-    @property
-    @staticmethod
-    def screenshots_folder():
-        screenshots_folder = os.path.join(BaseUtils.get_screenshot_folder(), MakeAction.screenshots_sub_folder)
-        return screenshots_folder
+    # @staticmethod
+    # def get_screenshots_folder():
+    #     screenshots_folder = os.path.join(BaseUtils.get_screenshot_folder(), MakeAction.screenshots_sub_folder)
+    #     logger.debug('screenshot_folder: %s' % screenshots_folder)
+    #     return screenshots_folder
 
     @staticmethod
     def delete_file(filepath):
@@ -5375,10 +5903,14 @@ class MakeAction:
     def delete_old_screenshots():
         tmp_files_to_delete = copy.deepcopy(MakeAction.files_to_delete)
         files_to_delete = []
-        for tmstmp, file_path in MakeAction.files_to_delete:
+        logger.debug('tmstmp now: %s, files_to_delete: %s' % (time.time(), tmp_files_to_delete))
+        for tmstmp, file_path in tmp_files_to_delete:
+            logger.debug('время хранения файла: %s. Путь %s' % (time.time() - tmstmp, file_path))
             if time.time() - tmstmp > 200:
+                logger.debug('Will remove: file_path: %s' % file_path)
                 MakeAction.delete_file(file_path)
             else:
+                logger.debug('Will not remove: file_path: %s' % file_path)
                 files_to_delete.append((tmstmp, file_path))
         MakeAction.files_to_delete = files_to_delete
 
@@ -5454,11 +5986,12 @@ class MakeAction:
     @staticmethod
     def make_screenshot(channel_full_guid, dt=None, file_name=None):
         logger.debug('make_screenshot channel_full_guid: %s' % channel_full_guid)
-
+        screenshot_folder = MakeAction.screenshots_folder
+        logger.debug('screenshot_folder: %s' % screenshot_folder)
         shot_saver.async_shot(channel_full_guid,
                               dt=dt,
                               file_name=file_name,
-                              file_path=MakeAction.screenshots_folder,
+                              file_path=screenshot_folder,
                               callback=MakeAction.call_back_screen_shot)
 
     @staticmethod
@@ -5548,18 +6081,50 @@ class MakeAction:
                 MakeAction.delete_old_screenshots()
 
 
-"""  Initialization  """
+def make_wide_range_report():
+    colors = {"Красный": "Red", "Зелёный": "Green", "Синий": "Blue"}
+    if object(SCHEDULE).state("color") == colors[SCHEDULE_COLOR]:
+        date_now = datetime.now().date().isoformat()
+        reporter.generate_reports(date_now, wide_range=True)
 
-if SEND_EMAIL:
-    email_sender = EmailSender(MAIL_ACCOUNT, MAIL_RECIPIENTS)
+
+"""  Initialization  """
 
 assert CHANNELS, 'Необходимо выбрать каналы для работы!'
 assert ZONES, 'Необходимо выбрать зоны для работы!'
+assert MAIL_ACCOUNT, 'Необходимо указать аккаунт email в Trassir!'
+assert MAIL_RECIPIENTS, 'Необходимо указать получателей уведомлений!'
+assert REPORT_MAIL_RECIPIENTS, 'Необходимо указать получателей отчётов!'
+
+email_sender = EmailSender(MAIL_ACCOUNT, MAIL_RECIPIENTS)
+report_email_sender = EmailSender(MAIL_ACCOUNT, REPORT_MAIL_RECIPIENTS, subject='Отчёт по очередям')
 
 shot_saver = ShotSaver()
+dates_suplier = DatesSupplier()
+db_manager = DataBaseManager()
+reporter = Reporter(report_email_sender,
+                    db_manager.get_data,
+                    db_manager.get_data_wide_range)
+# ACTIVATION BY SCHEDULE
+
+if ENABLE_SCHEDULE:
+    assert SCHEDULE, 'Необходимо выбрать расписание!'
+    assert SCHEDULE_COLOR, 'Необходимо выбрать цвет распивания для работы!'
+    report_schedule = object(SCHEDULE)
+    report_schedule.activate_on_state_changes(make_wide_range_report)
+
 
 deep_detection_handler = DeepDetectionHandler(CHANNELS, ZONES)
 activate_on_events("Object Entered the Zone", "", deep_detection_handler.handler)
 
-deep_detections_watcher = DeepDetectionsWatcher(DEEP_DETECTIONS_RISE_EVENT_DELAY, MAXPERSONS, MakeAction.process_ev)
+deep_detections_watcher = DeepDetectionsWatcher(DEEP_DETECTIONS_RISE_EVENT_DELAY,
+                                                MAXPERSONS,
+                                                MakeAction.process_ev,
+                                                db_manager.add_data)
 deep_detections_watcher.custom_deep_detections_watcher()
+
+worker(
+    check_day=dates_suplier.day_changed,
+    reports_generator= reporter.generate_reports,
+    first_export=EXPORT_AT_STARTUP,
+)
